@@ -21,6 +21,7 @@ import (
 	"github.com/docker/distribution/registry/client"
 	"github.com/docker/distribution/registry/client/transport"
 	"github.com/docker/docker/image"
+	"github.com/docker/docker/opts"
 	flag "github.com/docker/docker/pkg/mflag"
 	trust "github.com/docker/libtrust"
 
@@ -29,7 +30,8 @@ import (
 
 var (
 	verbose, help bool
-	target, key   string
+	target        string
+	keys          = opts.NewListOpts(nil)
 	ManifestType  = "application/vnd.docker.container.image.v1+json"
 	LayerType     = "application/vnd.docker.container.image.rootfs.diff+x-tar"
 )
@@ -45,8 +47,11 @@ type LayerMap map[string]*Layer
 func init() {
 	flag.BoolVar(&help, []string{"h", "-help"}, false, "Display help")
 	flag.BoolVar(&verbose, []string{"v", "-verbose"}, false, "Switch to verbose output")
-	flag.StringVar(&key, []string{"k", "-key-file"}, "", "Private key with which to sign")
+	flag.Var(&keys, []string{"k", "-key-file"}, "Private key with which to sign")
 	flag.Parse()
+	if kk := flag.Lookup("-k"); kk != nil {
+		keys = *kk.Value.(*opts.ListOpts)
+	}
 }
 
 func blobSumLayer(r *tar.Reader) (digest.Digest, error) {
@@ -151,7 +156,7 @@ func getLayerRaw(archive *tar.Reader, k string) ([]byte, error) {
 			if k == id {
 				buf := bytes.NewBuffer(nil)
 				bwr := bufio.NewWriter(buf)
-				io.Copy(bwr, archive)
+				_, err := io.Copy(bwr, archive)
 				return buf.Bytes(), err
 			}
 		}
@@ -160,7 +165,11 @@ func getLayerRaw(archive *tar.Reader, k string) ([]byte, error) {
 	return nil, fmt.Errorf("No layer with id: %s\n", k)
 }
 
-func uploadBlobsToRegistry(repostr string, archive *tar.Reader, file *os.File, layers []*Layer, manifest *manifest.SignedManifest) error {
+func uploadBlobsToRegistry(repostr string, file *os.File, layers []*Layer, manifest *manifest.SignedManifest) error {
+	/* rewind first */
+	file.Seek(0, 0)
+	archive := tar.NewReader(bufio.NewReader(file))
+
 	url, repo := splitUrlAndRepo(repostr)
 
 	tr := transport.NewTransport(http.DefaultTransport)
@@ -212,41 +221,119 @@ func uploadBlobsToRegistry(repostr string, archive *tar.Reader, file *os.File, l
 	return err
 }
 
-func processTarget(target string) (string, string, error) {
-	var pkey trust.PrivateKey
+func getKeys(keys []string) ([]trust.PrivateKey, error) {
+	var pkeys []trust.PrivateKey
 
-	if key != "" {
-		var err error
-		pkey, err = trust.LoadKeyFile(key)
-		if err != nil {
-			return "", "", err
-		}
+	if len(keys) != 0 {
+		for _, k := range keys {
+			pkey, err := trust.LoadKeyFile(k)
+			if err != nil {
+				return nil, err
+			}
 
-		if verbose {
-			fmt.Printf("Signing with: %s\n", pkey.KeyID())
+			if verbose {
+				fmt.Printf("Signing with: %s\n", pkey.KeyID())
+			}
+
+			pkeys = append(pkeys, pkey)
 		}
 	}
 
+	return pkeys, nil
+}
+
+func getFileFromTarget(target string) (*os.File, error) {
 	var f *os.File
 	if target != "-" {
 		var err error
 		f, err = os.Open(target)
 		if err != nil {
-			return "", "", err
+			return nil, err
 		}
-		defer func() {
-			if err := f.Close(); err != nil {
-				panic(err)
-			}
-		}()
 	} else {
 		f = os.Stdin
 	}
 
+	return f, nil
+}
+
+func createManifest(name string, tag string, arch string, ordered []*Layer) (*manifest.Manifest, []byte, digest.Digest, error) {
+	var m *manifest.Manifest
+	m = &manifest.Manifest{
+		Versioned: versioned.Versioned{
+			SchemaVersion: 1,
+		},
+		Name: name, Tag: tag, Architecture: arch}
+
+	for _, l := range ordered {
+		m.FSLayers = append(m.FSLayers, manifest.FSLayer{BlobSum: l.BlobSum})
+		m.History = append(m.History, manifest.History{V1Compatibility: l.Data})
+	}
+
+	dgstr := digest.Canonical.New()
+	data, err := json.MarshalIndent(m, "", "   ")
+	if err != nil {
+		return nil, nil, "", err
+	}
+
+	dgstr.Hash().Write(data)
+
+	return m, data, dgstr.Digest(), nil
+}
+
+func createSignedManifest(raw []byte, m *manifest.Manifest, keys []trust.PrivateKey) (*manifest.SignedManifest, error) {
+	var sigs []*trust.JSONSignature
+
+	for _, k := range keys {
+		js, err := trust.NewJSONSignature(raw)
+		if err != nil {
+			return nil, err
+		}
+		if err := js.Sign(k); err != nil {
+			return nil, err
+		}
+		sigs = append(sigs, js)
+	}
+
+	sg := sigs[0]
+	if err := sg.Merge(sigs[1:]...); err != nil {
+		return nil, err
+	}
+
+	bts, err := sg.PrettySignature("signatures")
+	if err != nil {
+		return nil, err
+	}
+
+	sm := &manifest.SignedManifest{Manifest: *m, Raw: bts}
+
+	return sm, nil
+}
+
+func processTarget(target string, keys []string) (string, string, error) {
 	var (
-		repo, tag, url string
+		repo, tag, name string
+		data            []byte
+		err             error
+		f               *os.File
+		pkeys           []trust.PrivateKey
+		layers          = LayerMap{}
 	)
-	layers := LayerMap{}
+
+	pkeys, err = getKeys(keys)
+	if err != nil {
+		return "", "", err
+	}
+
+	f, err = getFileFromTarget(target)
+	if err != nil {
+		return "", "", err
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			panic(err)
+		}
+	}()
 
 	t := tar.NewReader(bufio.NewReader(f))
 	for {
@@ -257,7 +344,11 @@ func processTarget(target string) (string, string, error) {
 
 		if strings.HasSuffix(hdr.Name, "layer.tar") {
 			id := getLayerPrefix(hdr.Name)
-			sum, _ := blobSumLayer(t)
+			sum, err := blobSumLayer(t)
+			if err != nil {
+				return "", "", err
+			}
+
 			if _, ok := layers[id]; !ok {
 				layers[id] = &Layer{Id: id}
 			} else {
@@ -266,8 +357,16 @@ func processTarget(target string) (string, string, error) {
 		}
 
 		if strings.HasSuffix(hdr.Name, "json") {
-			data, _ := ioutil.ReadAll(t)
-			parent, id, _ := getLayerInfo(data)
+			data, err := ioutil.ReadAll(t)
+			if err != nil {
+				return "", "", err
+			}
+
+			parent, id, err := getLayerInfo(data)
+			if err != nil {
+				return "", "", err
+			}
+
 			if _, ok := layers[id]; !ok {
 				layers[id] = &Layer{Id: id, Parent: parent}
 			} else {
@@ -275,14 +374,25 @@ func processTarget(target string) (string, string, error) {
 			}
 
 			var img image.Image
-			json.Unmarshal(data, &img)
-			b, _ := json.Marshal(img)
+			if err := json.Unmarshal(data, &img); err != nil {
+				return "", "", nil
+			}
+
+			b, err := json.Marshal(img)
+			if err != nil {
+				return "", "", nil
+			}
+
 			layers[id].Data = string(b) + "\n"
 		}
 
 		if hdr.Name == "repositories" {
-			r, _ := ioutil.ReadAll(t)
 			var raw map[string]interface{}
+			r, err := ioutil.ReadAll(t)
+			if err != nil {
+				return "", "", err
+			}
+
 			if err := json.Unmarshal(r, &raw); err != nil {
 				return "", "", err
 			}
@@ -295,45 +405,35 @@ func processTarget(target string) (string, string, error) {
 	}
 
 	if strings.Count(repo, "/") > 1 {
-		_, url = splitUrlAndRepo(repo)
+		_, name = splitUrlAndRepo(repo)
 	} else {
-		url = repo
+		name = repo
 	}
 
-	m := manifest.Manifest{
-		Versioned: versioned.Versioned{
-			SchemaVersion: 1,
-		},
-		Name: url, Tag: tag, Architecture: "amd64"}
-
-	ll := getLayersInOrder(getLayersFromMap(layers))
-	for _, l := range ll {
-		m.FSLayers = append(m.FSLayers, manifest.FSLayer{BlobSum: l.BlobSum})
-		m.History = append(m.History, manifest.History{V1Compatibility: l.Data})
-	}
-
-	dgstr := digest.Canonical.New()
-	x, err := json.MarshalIndent(m, "", "   ")
-	dgstr.Hash().Write(x)
-	dgst := dgstr.Digest().String()
-
-	if pkey != nil {
-		sm, err := manifest.Sign(&m, pkey)
-
-		/* rewind the archive */
-		f.Seek(0, 0)
-		t = tar.NewReader(bufio.NewReader(f))
-
-		err = uploadBlobsToRegistry(repo, t, f, ll, sm)
+	ordered := getLayersInOrder(getLayersFromMap(layers))
+	m, bytes, dgst, err := createManifest(name, tag, "amd64", ordered)
+	if len(pkeys) != 0 {
+		sm, err := createSignedManifest(bytes, m, pkeys)
 		if err != nil {
 			return "", "", err
 		}
-		x, err = sm.MarshalJSON()
-		return dgst, string(x), err
+
+		err = uploadBlobsToRegistry(repo, f, ordered, sm)
+		if err != nil {
+			return "", "", err
+		}
+
+		data, err = sm.MarshalJSON()
 	} else {
-		x, err = json.MarshalIndent(m, "", "   ")
-		return dgst, string(x), err
+		data, err = json.MarshalIndent(m, "", "   ")
 	}
+
+	if err != nil {
+		return "", "", err
+	}
+
+	return dgst.String(), string(data), err
+
 }
 
 func main() {
@@ -341,12 +441,14 @@ func main() {
 		flag.PrintDefaults()
 	} else {
 		target := flag.Arg(0)
-		if key == "" {
-			fmt.Fprintln(os.Stderr, "WARNING: No signing key specified, upload *DISABLED*")
+
+		if keys.Len() == 0 {
+			fmt.Fprintln(os.Stderr, "WARNING: No signing keys specified, upload *DISABLED*")
 		}
 
 		if target != "" {
-			digest, manifest, err := processTarget(target)
+			strkeys := keys.GetAll()
+			digest, manifest, err := processTarget(target, strkeys)
 			if err != nil {
 				fmt.Printf("Error processing target: %s\n", err)
 				os.Exit(1)
